@@ -1,120 +1,74 @@
-import os
+ import os
+import time
+import threading
 import requests
+from flask import Flask
 import pandas as pd
 import ta
-from flask import Flask
 from dotenv import load_dotenv
+import datetime
 
-# Load environment variables
+# ------------------- Load Secrets -------------------
 load_dotenv()
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
+# ------------------- Flask Web App -------------------
 app = Flask(__name__)
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-CHAT_ID = os.getenv("CHAT_ID")
+@app.route('/')
+def home():
+    return "SMC Telegram Bot is Running..."
 
-PAIRS = ['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'BNBUSDT', 'XRPUSDT']
-TIMEFRAME = '15m'
+# ------------------- SMC Strategy -------------------
+def fetch_ohlcv(symbol='BTCUSDT', interval='15m', limit=100):
+    url = f'https://api.binance.com/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}'
+    response = requests.get(url)
+    data = response.json()
 
-BINANCE_ENDPOINT = 'https://api.binance.com/api/v3/klines'
+    df = pd.DataFrame(data, columns=[
+        'timestamp', 'open', 'high', 'low', 'close', 'volume',
+        'close_time', 'quote_asset_volume', 'number_of_trades',
+        'taker_buy_base_volume', 'taker_buy_quote_volume', 'ignore'
+    ])
 
-# Fetch live candle data from Binance
-def fetch_candles(symbol, interval='15m', limit=150):
-    try:
-        url = f"{BINANCE_ENDPOINT}?symbol={symbol}&interval={interval}&limit={limit}"
-        response = requests.get(url)
-        response.raise_for_status()
-        data = response.json()
-        df = pd.DataFrame(data, columns=[
-            'time', 'open', 'high', 'low', 'close', 'volume',
-            'close_time', 'qav', 'trades', 'tbbav', 'tbqav', 'ignore'
-        ])
-        df['time'] = pd.to_datetime(df['time'], unit='ms')
-        df = df[['time', 'open', 'high', 'low', 'close']]
-        df = df.astype(float)
-        return df
-    except Exception as e:
-        print(f"Error fetching data for {symbol}: {e}")
-        return None
+    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+    df[['open', 'high', 'low', 'close', 'volume']] = df[['open', 'high', 'low', 'close', 'volume']].astype(float)
+    return df
 
-# Trend Detection using EMA50
-def detect_trend(df):
-    df['ema50'] = ta.trend.ema_indicator(df['close'], window=50).fillna(0)
-    if df['close'].iloc[-1] > df['ema50'].iloc[-1]:
-        return 'bullish'
-    elif df['close'].iloc[-1] < df['ema50'].iloc[-1]:
-        return 'bearish'
-    else:
-        return 'sideways'
-
-# Fair Value Gap (FVG) Detection
-def detect_fvg(df):
-    gaps = []
-    for i in range(2, len(df)):
-        if df['low'].iloc[i] > df['high'].iloc[i-2]:
-            gaps.append(('bullish', df['high'].iloc[i-2], df['low'].iloc[i]))
-        elif df['high'].iloc[i] < df['low'].iloc[i-2]:
-            gaps.append(('bearish', df['low'].iloc[i-2], df['high'].iloc[i]))
-    return gaps
-
-# Liquidity Sweep Detection (simplified wick logic)
-def swept_liquidity(df, trend):
-    if trend == 'bullish':
-        wick = df['low'].iloc[-2]
-        body = min(df['open'].iloc[-2], df['close'].iloc[-2])
-        return wick < body
-    elif trend == 'bearish':
-        wick = df['high'].iloc[-2]
-        body = max(df['open'].iloc[-2], df['close'].iloc[-2])
-        return wick > body
+def detect_order_block(df):
+    # Simple bullish OB: A big down candle followed by bullish BOS
+    last = df.iloc[-5:]
+    if all(last['close'].iloc[i] < last['open'].iloc[i] for i in range(2)) and last['close'].iloc[-1] > last['high'].iloc[-2]:
+        return True
     return False
 
-# Order Block Detection + A+ Setup Logic
-def detect_a_plus_setup(df, trend):
-    if trend == 'bullish':
-        # Look for last down candle before BOS
-        for i in range(len(df)-6, len(df)-2):
-            if df['close'].iloc[i] < df['open'].iloc[i] and df['high'].iloc[i+1] > df['high'].iloc[i-1]:
-                ob = {
-                    'entry': df['open'].iloc[i],
-                    'sl': df['low'].iloc[i] - 0.001 * df['low'].iloc[i],
-                    'bos': True
-                }
-                current_price = df['close'].iloc[-1]
-                if ob['entry'] - 0.001 < current_price < ob['entry'] + 0.001:
-                    fvg = detect_fvg(df)
-                    if fvg and swept_liquidity(df, trend):
-                        tp = ob['entry'] + (ob['entry'] - ob['sl']) * 2.5
-                        return {
-                            'side': 'buy',
-                            'entry': round(ob['entry'], 2),
-                            'sl': round(ob['sl'], 2),
-                            'tp': round(tp, 2),
-                            'bos': True
-                        }
-    elif trend == 'bearish':
-        for i in range(len(df)-6, len(df)-2):
-            if df['close'].iloc[i] > df['open'].iloc[i] and df['low'].iloc[i+1] < df['low'].iloc[i-1]:
-                ob = {
-                    'entry': df['open'].iloc[i],
-                    'sl': df['high'].iloc[i] + 0.001 * df['high'].iloc[i],
-                    'bos': True
-                }
-                current_price = df['close'].iloc[-1]
-                if ob['entry'] - 0.001 < current_price < ob['entry'] + 0.001:
-                    fvg = detect_fvg(df)
-                    if fvg and swept_liquidity(df, trend):
-                        tp = ob['entry'] - (ob['sl'] - ob['entry']) * 2.5
-                        return {
-                            'side': 'sell',
-                            'entry': round(ob['entry'], 2),
-                            'sl': round(ob['sl'], 2),
-                            'tp': round(tp, 2),
-                            'bos': True
-                        }
-    return None
+def detect_bos(df):
+    highs = df['high']
+    return highs.iloc[-1] > max(highs.iloc[-5:-1])
 
-# Telegram Alert
+def detect_fvg(df):
+    prev_high = df['high'].iloc[-2]
+    curr_low = df['low'].iloc[-1]
+    return curr_low > prev_high  # Fair Value Gap
+
+def detect_trend(df):
+    ma50 = ta.trend.sma_indicator(df['close'], window=50)
+    ma200 = ta.trend.sma_indicator(df['close'], window=200)
+    return ma50.iloc[-1] > ma200.iloc[-1]  # Uptrend
+
+def analyze_smc_and_send_signal():
+    pairs = ['BTCUSDT', 'ETHUSDT', 'BNBUSDT', 'SOLUSDT', 'AVAXUSDT']
+    interval = '15m'
+    
+    for pair in pairs:
+        df = fetch_ohlcv(pair, interval)
+
+        if detect_order_block(df) and detect_bos(df) and detect_fvg(df) and detect_trend(df):
+            time_now = datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')
+            message = f"📈 *A+ SMC Trade Signal!*\n\n📌 Pair: {pair}\n🕒 Time: {time_now}\n\nSMC Confluence:\n✅ Order Block Hit\n✅ BOS\n✅ Fair Value Gap\n✅ Uptrend\n\n👉 Confirm setup and enter wisely."
+            send_telegram(message)
+
 def send_telegram(message):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     payload = {
@@ -125,39 +79,21 @@ def send_telegram(message):
     try:
         requests.post(url, data=payload)
     except Exception as e:
-        print(f"Telegram error: {e}")
+        print(f"Telegram Error: {e}")
 
-# Market Analysis
-def analyze_market():
-    for symbol in PAIRS:
-        df = fetch_candles(symbol)
-        if df is None:
-            continue
+# ------------------- Bot Loop -------------------
+def bot_loop():
+    while True:
+        try:
+            print("Running SMC analysis...")
+            analyze_smc_and_send_signal()
+        except Exception as err:
+            print(f"Error in bot loop: {err}")
+        print("Sleeping for 30 minutes...")
+        time.sleep(1800)  # 30 minutes
 
-        trend = detect_trend(df)
-        if trend == 'sideways':
-            continue
-
-        signal = detect_a_plus_setup(df, trend)
-        if signal:
-            message = f"""
-📊 *SMC Trade Signal - {symbol}*
-🕒 Timeframe: 15m
-📈 Trend: *{trend.upper()}*
-🔹 Setup: BOS + OB + FVG + Liquidity Sweep
-🎯 Entry: {signal['entry']}
-🛑 SL: {signal['sl']}
-🏁 TP: {signal['tp']}
-📊 R:R = 1:2.5
-✅ Status: A+ Setup Confirmed
-            """
-            send_telegram(message.strip())
-
-# Flask route for Render ping
-@app.route('/webhook', methods=['GET'])
-def webhook():
-    analyze_market()
-    return "SMC scan complete ✅"
+# ------------------- Start Everything -------------------
+threading.Thread(target=bot_loop).start()
 
 if __name__ == '__main__':
-    app.run(debug=True)
+    app.run(host='0.0.0.0', port=10000)
