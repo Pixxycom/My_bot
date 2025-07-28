@@ -1,4 +1,5 @@
-python-dotenv
+flask
 requests
 pandas
-pyTelegramBotAPI
+ta
+python-dotenv
