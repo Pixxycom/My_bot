@@ -2,11 +2,11 @@ import os
 import time
 import threading
 import requests
-from flask import Flask
+import datetime
 import pandas as pd
 import ta
+from flask import Flask
 from dotenv import load_dotenv
-import datetime
 
 # ------------------- Load Secrets -------------------
 load_dotenv()
@@ -20,24 +20,25 @@ app = Flask(__name__)
 def home():
     return "SMC Telegram Bot is Running..."
 
+@app.before_first_request
+def start_bot():
+    threading.Thread(target=bot_loop).start()
+
 # ------------------- SMC Strategy -------------------
 def fetch_ohlcv(symbol='BTCUSDT', interval='15m', limit=100):
     url = f'https://api.binance.com/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}'
     response = requests.get(url)
     data = response.json()
-
     df = pd.DataFrame(data, columns=[
         'timestamp', 'open', 'high', 'low', 'close', 'volume',
         'close_time', 'quote_asset_volume', 'number_of_trades',
         'taker_buy_base_volume', 'taker_buy_quote_volume', 'ignore'
     ])
-
     df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
     df[['open', 'high', 'low', 'close', 'volume']] = df[['open', 'high', 'low', 'close', 'volume']].astype(float)
     return df
 
 def detect_order_block(df):
-    # Simple bullish OB: A big down candle followed by bullish BOS
     last = df.iloc[-5:]
     if all(last['close'].iloc[i] < last['open'].iloc[i] for i in range(2)) and last['close'].iloc[-1] > last['high'].iloc[-2]:
         return True
@@ -50,23 +51,27 @@ def detect_bos(df):
 def detect_fvg(df):
     prev_high = df['high'].iloc[-2]
     curr_low = df['low'].iloc[-1]
-    return curr_low > prev_high  # Fair Value Gap
+    return curr_low > prev_high
 
 def detect_trend(df):
     ma50 = ta.trend.sma_indicator(df['close'], window=50)
     ma200 = ta.trend.sma_indicator(df['close'], window=200)
-    return ma50.iloc[-1] > ma200.iloc[-1]  # Uptrend
+    return ma50.iloc[-1] > ma200.iloc[-1]
 
 def analyze_smc_and_send_signal():
     pairs = ['BTCUSDT', 'ETHUSDT', 'BNBUSDT', 'SOLUSDT', 'AVAXUSDT']
     interval = '15m'
-    
     for pair in pairs:
         df = fetch_ohlcv(pair, interval)
-
         if detect_order_block(df) and detect_bos(df) and detect_fvg(df) and detect_trend(df):
             time_now = datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')
-            message = f"📈 *A+ SMC Trade Signal!*\n\n📌 Pair: {pair}\n🕒 Time: {time_now}\n\nSMC Confluence:\n✅ Order Block Hit\n✅ BOS\n✅ Fair Value Gap\n✅ Uptrend\n\n👉 Confirm setup and enter wisely."
+            message = (
+                f"📈 *A+ SMC Trade Signal!*\n\n"
+                f"📌 Pair: {pair}\n🕒 Time: {time_now}\n\n"
+                f"SMC Confluence:\n"
+                f"✅ Order Block Hit\n✅ BOS\n✅ Fair Value Gap\n✅ Uptrend\n\n"
+                f"👉 Confirm setup and enter wisely."
+            )
             send_telegram(message)
 
 def send_telegram(message):
@@ -90,10 +95,8 @@ def bot_loop():
         except Exception as err:
             print(f"Error in bot loop: {err}")
         print("Sleeping for 30 minutes...")
-        time.sleep(1800)  # 30 minutes
+        time.sleep(1800)
 
-# ------------------- Start Everything -------------------
-threading.Thread(target=bot_loop).start()
-
+# ------------------- App Entry -------------------
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=10000)
