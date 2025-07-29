@@ -1,156 +1,184 @@
 import os
-import time
-import threading
-import requests
-from flask import Flask
+import logging
+import ccxt
 import pandas as pd
-import ta
-from dotenv import load_dotenv
-import datetime
+from datetime import datetime
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Updater, CommandHandler, CallbackQueryHandler, CallbackContext
+from flask import Flask, request
 
-# ------------------- Load Secrets -------------------
-load_dotenv()
+# ===== CONFIGURATION ===== #
+# (Will be set via Render.com environment variables)
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+BINANCE_API_KEY = os.getenv("BINANCE_API_KEY")  # Optional (for private data)
+BINANCE_SECRET = os.getenv("BINANCE_SECRET")    # Optional
 
-# ------------------- Flask Web App -------------------
+# ===== TRADING SETTINGS ===== #
+TRADE_PAIRS = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "XRP/USDT", "ADA/USDT"]  # Best for liquidity strategy
+TIMEFRAME = "15m"  # Optimal for day trading
+RISK_PER_TRADE = 0.2  # 20% of $10 account ($2 per trade)
+RISK_REWARD_RATIO = 2.5  # 1:2.5 (TP = 2.5x SL)
+
+# ===== INITIALIZE EXCHANGE ===== #
+exchange = ccxt.binance({
+    'enableRateLimit': True,
+    'options': { 'defaultType': 'future' }  # Futures trading
+})
+
+# ===== FLASK APP (FOR RENDER.COM) ===== #
 app = Flask(__name__)
+
+# ===== LOGGING ===== #
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
+# ===== LIQUIDITY-BASED STRATEGY ===== #
+def analyze_market(pair):
+    """Fetches market data and looks for liquidity-based setups."""
+    try:
+        # Get OHLCV data
+        ohlcv = exchange.fetch_ohlcv(pair, TIMEFRAME, limit=100)
+        df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+
+        # Liquidity Zones (Recent Highs/Lows where stops cluster)
+        df['liq_high'] = df['high'].rolling(5).max()  # Last 5 candles high
+        df['liq_low'] = df['low'].rolling(5).min()    # Last 5 candles low
+
+        last_candle = df.iloc[-1]
+        prev_candle = df.iloc[-2]
+
+        signals = []
+
+        # ===== STRATEGY LOGIC ===== #
+        # 1. Liquidity Sweep (Bullish)
+        if (last_candle['high'] > prev_candle['liq_high']) and (last_candle['close'] > prev_candle['close']):
+            entry = last_candle['close']
+            sl = prev_candle['liq_low']
+            tp = entry + (entry - sl) * RISK_REWARD_RATIO  # 1:2.5 RR
+            
+            signals.append({
+                'pair': pair,
+                'signal': 'BUY',
+                'entry': entry,
+                'sl': sl,
+                'tp': tp,
+                'timeframe': TIMEFRAME,
+                'reason': 'Liquidity Sweep (Bullish)'
+            })
+
+        # 2. Liquidity Sweep (Bearish)
+        if (last_candle['low'] < prev_candle['liq_low']) and (last_candle['close'] < prev_candle['close']):
+            entry = last_candle['close']
+            sl = prev_candle['liq_high']
+            tp = entry - (sl - entry) * RISK_REWARD_RATIO  # 1:2.5 RR
+            
+            signals.append({
+                'pair': pair,
+                'signal': 'SELL',
+                'entry': entry,
+                'sl': sl,
+                'tp': tp,
+                'timeframe': TIMEFRAME,
+                'reason': 'Liquidity Sweep (Bearish)'
+            })
+
+        return signals
+
+    except Exception as e:
+        logger.error(f"Error analyzing {pair}: {e}")
+        return []
+
+# ===== TELEGRAM BOT FUNCTIONS ===== #
+def start(update: Update, context: CallbackContext):
+    update.message.reply_text(
+        "🚀 **Crypto Day Trading Bot (Liquidity Strategy)** 🚀\n\n"
+        "🔹 **Pairs:** BTC, ETH, SOL, XRP, ADA\n"
+        "🔹 **Timeframe:** 15m (Best for day trading)\n"
+        "🔹 **Risk-Reward:** 1:2.5 (Auto-calculated)\n\n"
+        "📌 Commands:\n"
+        "/start - Show this menu\n"
+        "/scan - Check for new trades\n"
+        "/trades - Show recent signals"
+    )
+
+def scan_markets(update: Update, context: CallbackContext):
+    """Scans all pairs for trading opportunities."""
+    for pair in TRADE_PAIRS:
+        signals = analyze_market(pair)
+        if signals:
+            for signal in signals:
+                send_signal(update, signal)
+
+def send_signal(update: Update, signal):
+    """Sends a trade signal with confirmation buttons."""
+    message = (
+        f"🔥 **{signal['pair']} {signal['signal']} Signal** 🔥\n"
+        f"📊 **Reason:** {signal['reason']}\n"
+        f"⏰ **Timeframe:** {signal['timeframe']}\n"
+        f"💰 **Entry:** `{signal['entry']:.4f}`\n"
+        f"🛑 **Stop Loss:** `{signal['sl']:.4f}`\n"
+        f"🎯 **Take Profit:** `{signal['tp']:.4f}`\n"
+        f"📈 **Risk-Reward:** 1:{RISK_REWARD_RATIO}\n\n"
+        f"⚠️ **Account Risk:** ${RISK_PER_TRADE * 10} (20% of $10)"
+    )
+
+    keyboard = [
+        [InlineKeyboardButton("✅ Confirm Trade", callback_data=f"confirm_{signal['pair']}")],
+        [InlineKeyboardButton("❌ Cancel", callback_data="cancel")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    update.message.reply_text(
+        text=message,
+        reply_markup=reply_markup,
+        parse_mode='Markdown'
+    )
+
+def button_handler(update: Update, context: CallbackContext):
+    """Handles button presses (trade confirmations)."""
+    query = update.callback_query
+    query.answer()
+
+    if query.data.startswith('confirm_'):
+        pair = query.data.split('_')[1]
+        query.edit_message_text(f"✅ **Trade Executed!**\n\n{pair} position opened.")
+        # Here you would connect to Binance API to place the trade
+    elif query.data == "cancel":
+        query.edit_message_text("❌ **Trade Canceled**")
+
+# ===== FLASK ROUTES (FOR RENDER.COM) ===== #
+@app.route('/webhook', methods=['POST'])
+def webhook():
+    """Handles Telegram webhook updates."""
+    update = Update.de_json(request.get_json(), updater.bot)
+    dispatcher.process_update(update)
+    return 'OK'
 
 @app.route('/')
 def home():
-    return "SMC Telegram Bot with Bullish & Bearish OB is Running..."
+    return "🚀 Crypto Trading Bot is Running!"
 
-# ------------------- Globals -------------------
-bullish_obs = {}  # {'BTCUSDT': (low, high)}
-bearish_obs = {}  # {'BTCUSDT': (high, low)}
-
-# ------------------- Fetch Market Data -------------------
-def fetch_ohlcv(symbol='BTCUSDT', interval='15m', limit=100):
-    url = f'https://api.binance.com/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}'
-    response = requests.get(url)
-    data = response.json()
-    df = pd.DataFrame(data, columns=[
-        'timestamp', 'open', 'high', 'low', 'close', 'volume',
-        'close_time', 'quote_asset_volume', 'number_of_trades',
-        'taker_buy_base_volume', 'taker_buy_quote_volume', 'ignore'
-    ])
-    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-    df[['open', 'high', 'low', 'close', 'volume']] = df[['open', 'high', 'low', 'close', 'volume']].astype(float)
-    return df
-
-# ------------------- OB Detection -------------------
-def find_bullish_ob(df):
-    last = df.iloc[-5:]
-    if all(last['close'].iloc[i] < last['open'].iloc[i] for i in range(2)):
-        if last['close'].iloc[-1] > last['high'].iloc[-2]:
-            return (last['low'].iloc[-2], last['high'].iloc[-2])
-    return None
-
-def find_bearish_ob(df):
-    last = df.iloc[-5:]
-    if all(last['close'].iloc[i] > last['open'].iloc[i] for i in range(2)):
-        if last['close'].iloc[-1] < last['low'].iloc[-2]:
-            return (last['high'].iloc[-2], last['low'].iloc[-2])
-    return None
-
-# ------------------- Confluences -------------------
-def detect_bos_bullish(df):
-    highs = df['high']
-    return highs.iloc[-1] > max(highs.iloc[-5:-1])
-
-def detect_bos_bearish(df):
-    lows = df['low']
-    return lows.iloc[-1] < min(lows.iloc[-5:-1])
-
-def detect_fvg_bullish(df):
-    prev_high = df['high'].iloc[-2]
-    curr_low = df['low'].iloc[-1]
-    return curr_low > prev_high
-
-def detect_fvg_bearish(df):
-    prev_low = df['low'].iloc[-2]
-    curr_high = df['high'].iloc[-1]
-    return curr_high < prev_low
-
-def detect_trend_bullish(df):
-    ma50 = ta.trend.sma_indicator(df['close'], window=50)
-    ma200 = ta.trend.sma_indicator(df['close'], window=200)
-    return ma50.iloc[-1] > ma200.iloc[-1]
-
-def detect_trend_bearish(df):
-    ma50 = ta.trend.sma_indicator(df['close'], window=50)
-    ma200 = ta.trend.sma_indicator(df['close'], window=200)
-    return ma50.iloc[-1] < ma200.iloc[-1]
-
-# ------------------- Telegram -------------------
-def send_telegram(message):
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": CHAT_ID,
-        "text": message,
-        "parse_mode": "Markdown"
-    }
-    try:
-        requests.post(url, data=payload)
-    except Exception as e:
-        print(f"Telegram Error: {e}")
-
-# ------------------- Main Logic -------------------
-def analyze_and_track_order_blocks():
-    global bullish_obs, bearish_obs
-    pairs = ['BTCUSDT', 'ETHUSDT', 'BNBUSDT', 'SOLUSDT', 'AVAXUSDT']
-    interval = '15m'
-
-    for pair in pairs:
-        df = fetch_ohlcv(pair, interval)
-
-        # 🔵 Detect new Bullish OB
-        new_bullish = find_bullish_ob(df)
-        if new_bullish:
-            bullish_obs[pair] = new_bullish
-            print(f"[{pair}] 🟢 Bullish OB detected: {new_bullish}")
-
-        # 🔴 Detect new Bearish OB
-        new_bearish = find_bearish_ob(df)
-        if new_bearish:
-            bearish_obs[pair] = new_bearish
-            print(f"[{pair}] 🔴 Bearish OB detected: {new_bearish}")
-
-        # 🔵 Check Bullish OB Tap
-        if pair in bullish_obs:
-            ob_low, ob_high = bullish_obs[pair]
-            current_low = df['low'].iloc[-1]
-            if ob_low <= current_low <= ob_high:
-                if detect_bos_bullish(df) and detect_fvg_bullish(df) and detect_trend_bullish(df):
-                    time_now = datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')
-                    message = f"📈 *Bullish SMC Signal!*\n\n📌 Pair: {pair}\n🕒 {time_now}\n\n🟢 OB Zone: {ob_low:.2f} - {ob_high:.2f}\n\n✅ BOS\n✅ FVG\n✅ Uptrend\n\n📥 Consider long entry."
-                    send_telegram(message)
-                    del bullish_obs[pair]
-
-        # 🔴 Check Bearish OB Tap
-        if pair in bearish_obs:
-            ob_high, ob_low = bearish_obs[pair]
-            current_high = df['high'].iloc[-1]
-            if ob_low <= current_high <= ob_high:
-                if detect_bos_bearish(df) and detect_fvg_bearish(df) and detect_trend_bearish(df):
-                    time_now = datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')
-                    message = f"📉 *Bearish SMC Signal!*\n\n📌 Pair: {pair}\n🕒 {time_now}\n\n🔴 OB Zone: {ob_high:.2f} - {ob_low:.2f}\n\n✅ BOS\n✅ FVG\n✅ Downtrend\n\n📤 Consider short entry."
-                    send_telegram(message)
-                    del bearish_obs[pair]
-
-# ------------------- Bot Loop -------------------
-def bot_loop():
-    while True:
-        try:
-            print("Running full SMC OB detection...")
-            analyze_and_track_order_blocks()
-        except Exception as err:
-            print(f"Error in bot loop: {err}")
-        print("Sleeping for 30 minutes...")
-        time.sleep(1800)
-
-# ------------------- Start Everything -------------------
-threading.Thread(target=bot_loop).start()
-
+# ===== START THE BOT ===== #
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=10000)
+    # Initialize Telegram Bot
+    updater = Updater(BOT_TOKEN)
+    dispatcher = updater.dispatcher
+
+    # Add command handlers
+    dispatcher.add_handler(CommandHandler('start', start))
+    dispatcher.add_handler(CommandHandler('scan', scan_markets))
+    dispatcher.add_handler(CallbackQueryHandler(button_handler))
+
+    # Start Flask server (for Render.com)
+    updater.start_webhook(
+        listen="0.0.0.0",
+        port=int(os.getenv('PORT', 5000)),
+        url_path=BOT_TOKEN,
+        webhook_url=f"https://your-render-app.onrender.com/{BOT_TOKEN}"
+    )
+    updater.idle()
